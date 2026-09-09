@@ -1,0 +1,13 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync,readdirSync,writeFileSync} from 'node:fs';import {createHash} from 'node:crypto';
+import {createSession} from '../scripts/native/session.mjs';import {JitMachine} from '../runtime/jit-machine.mjs';import {Win32Host} from '../runtime/win32.mjs';
+test('D3DX cdecl floor returns a double in x87 ST0 without changing the caller stack',async()=>{
+  const m=await JitMachine.create(readFileSync('../[th10] 东方风神录 (汉化版+日文版)/th10.exe'));new Win32Host(m);try{const entry=m.registerImport({dll:'msvcrt.dll',name:'floor'}),p=m.allocate(64),out=p+48,call=p+8,relative=new Uint8Array(4);new DataView(relative.buffer).setInt32(0,entry-call-5,true);m.cpu.mem_write(p,[0xff,0x74,0x24,8,0xff,0x74,0x24,8,0xe8,...relative,0x83,0xc4,8,0xdd,0x1d,...new Uint8Array(new Uint32Array([out]).buffer),0xc2,8,0]);
+    for(const number of [-123.456,-1,-.25,0,.9999,3.14159,1e10,Infinity,-Infinity]){const b=new Uint8Array(8),v=new DataView(b.buffer);v.setFloat64(0,number,true);m.call(p,{args:[v.getUint32(0,true),v.getUint32(4,true)]});assert.equal(new DataView(m.bytes(out,8).buffer).getFloat64(0,true),Math.floor(number));assert.equal(m.reg('ESP'),m.stack);}
+  }finally{m.close();}
+});
+test('all original sound effects reach DirectSound with unchanged PCM and sample rates',async()=>{
+  const digest=b=>createHash('sha256').update(b).digest('hex'),assets=new Map();for(const name of readdirSync('reference/jp').filter(n=>n.endsWith('.wav'))){const file=readFileSync('reference/jp/'+name);let format,pcm;for(let p=12;p+8<=file.length;){const n=file.readUInt32LE(p+4),type=file.toString('ascii',p,p+4);if(type==='fmt ')format=file.subarray(p+8,p+8+n);if(type==='data')pcm=file.subarray(p+8,p+8+n);p+=8+n+(n&1);}assert(pcm&&format,name);assets.set(digest(pcm),{name,rate:format.readUInt32LE(4),channels:format.readUInt16LE(2),bits:format.readUInt16LE(14)});}
+  const s=await createSession();try{s.frames(450);const matched=new Set(),buffers=[];for(const b of s.host.sound.buffers){if(b.flags&1)continue;const asset=assets.get(digest(s.m.bytes(b.data,b.length)));if(asset){const format=new DataView(b.format.buffer);assert.equal(b.frequency,asset.rate,asset.name);assert.equal(format.getUint16(2,true),asset.channels);assert.equal(format.getUint16(14,true),asset.bits);matched.add(asset.name);buffers.push(asset.name);}}
+    writeFileSync('artifacts/audio-pcm-check.json',JSON.stringify({available:assets.size,matched:[...matched],buffers:buffers.length},null,2));assert.equal(matched.size,assets.size,'Every original effect must be loaded without synthesizing replacements');
+  }finally{s.close();}
+});

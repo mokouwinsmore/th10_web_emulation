@@ -1,0 +1,4 @@
+import {readFileSync,writeFileSync,readdirSync,mkdirSync} from 'node:fs';import {execFileSync} from 'node:child_process';
+const root=process.argv[2]??'artifacts/browser-quality-jp/pixels',native=root+'/windows';mkdirSync(native,{recursive:true});const results=[];
+for(const name of readdirSync(root).filter(n=>n.endsWith('.json'))){execFileSync('artifacts/D3D9Oracle.exe',[root+'/'+name,native],{stdio:'inherit'});const key=name.slice(0,-5),c=JSON.parse(readFileSync(root+'/'+name))[0],a=readFileSync(root+'/'+key+'.bin'),b=readFileSync(native+'/'+key+'.bin');let different=0,max=0,total=0,large=0;for(let i=0;i<a.length;i++){if(c.format===22&&i%4===3)continue;const d=Math.abs(a[i]-b[i]);different+=d!==0;max=Math.max(max,d);total+=d;large+=d>8;}results.push({name:key,different,large,max,mean:total/(640*480*3),bytes:a.length});}
+writeFileSync(root+'/comparison.json',JSON.stringify(results,null,2));console.table(results);

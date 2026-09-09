@@ -1,0 +1,3 @@
+// Diagnostic hook only. It is never copied into dist or the playable package.
+// Preserve the original six-byte prologue and continue the original function.
+export function stageFixture(s,stage){const m=s.m,address=0x417870,trampoline=s.host.alloc(16),old=m.bytes(address,6),jump=(from,to)=>{const b=new Uint8Array(5);b[0]=0xe9;new DataView(b.buffer).setInt32(1,to-from-5,true);return b;};m.cpu.mem_write(trampoline,[...old,...jump(trampoline+6,address+6)]);let first=true;const entry=m.registerImport({dll:'native-host',name:'test.stage-entry',argc:0,handler:()=>{if(first){m.u32(0x474c7c,stage);m.u32(0x474c80,stage);m.u32(0x477848,0x474788+stage*48);first=false;}m.reg('EIP',trampoline);return {blocked:true};}});m.cpu.mem_write(address,jump(address,entry));}

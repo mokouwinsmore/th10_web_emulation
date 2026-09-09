@@ -1,0 +1,20 @@
+"""Adapt the reference platform's offscreen fixture runner to D3D9's ABI."""
+from pathlib import Path
+s=Path('../th08_web/scripts/native/D3D8Oracle.cs').read_text(encoding='utf-8')
+s=s.replace('Direct3D 8','Direct3D 9').replace('D3D8','D3D9').replace('d3d8.dll','d3d9.dll').replace('Direct3DCreate8','Direct3DCreate9').replace('TH08','TH10').replace('Create9(220)','Create9(32)')
+s=s.replace('multisample,swap','multisample,quality,swap').replace('if(IntPtr.Size!=4)throw new Exception("Compile /platform:x86");','')
+s=s.replace('uint multi,int locked,out IntPtr target','uint multi,uint quality,int locked,out IntPtr target,IntPtr shared').replace('uint multi,out IntPtr target','uint multi,uint quality,int discard,out IntPtr target,IntPtr shared').replace('uint pool,out IntPtr texture','uint pool,out IntPtr texture,IntPtr shared')
+s=s.replace('delegate int SetTarget(IntPtr p,IntPtr target,IntPtr depth);','delegate int SetColorTarget(IntPtr p,uint index,IntPtr target);\n  [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int SetDepthTarget(IntPtr p,IntPtr target);\n  [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int GetColorTarget(IntPtr p,uint index,out IntPtr target);')
+s=s.replace('delegate int ImageSurface(IntPtr p,uint w,uint h,uint format,out IntPtr surface);','delegate int ImageSurface(IntPtr p,uint w,uint h,uint format,uint pool,out IntPtr surface,IntPtr shared);')
+for kind,old,new in [('CreateDevice',15,16),('GetSurface',33,40),('RenderTarget',25,28),('DepthSurface',26,29),('Texture',20,23),('LockTexture',16,19),('UnlockTexture',17,20),('LockSurface',9,13),('Viewport',40,47),('Clear',36,43),('State',50,57),('StageState',63,67),('Transform',37,44),('SetTexture',61,65),('Shader',76,89),('Draw',72,83),('Simple',34,41),('Simple',35,42)]:
+ s=s.replace(f'Fn<{kind}>(device,{old})',f'Fn<{kind}>(device,{new})').replace(f'Fn<{kind}>(texture,{old})',f'Fn<{kind}>(texture,{new})').replace(f'Fn<{kind}>(target,{old})',f'Fn<{kind}>(target,{new})').replace(f'Fn<{kind}>(surface,{old})',f'Fn<{kind}>(surface,{new})')
+s=s.replace('Fn<Simple>(surface,10)','Fn<Simple>(surface,14)').replace('Fn<Simple>(target,10)','Fn<Simple>(target,14)')
+s=s.replace('Fn<CreateDevice>(d3d,15)','Fn<CreateDevice>(d3d,16)')
+s=s.replace('Fn<GetSurface>(device,32)(device,out back)','Fn<GetColorTarget>(device,38)(device,0,out back)').replace('Fn<SetTarget>(device,31)(device,target,depth)','SetTargets(device,target,depth)').replace('Fn<SetTarget>(device,31)(device,back,originalDepth)','SetTargets(device,back,originalDepth)')
+s=s.replace('format,0,1,out target)','format,0,0,1,out target,IntPtr.Zero)').replace('80,0,out depth)','80,0,0,1,out depth,IntPtr.Zero)').replace('tf,1,out texture)','tf,1,out texture,IntPtr.Zero)')
+s=s.replace('Check(Fn<StageState>(device,67)(device,0,U(a[0]),U(a[1])));','uint key=U(a[0]);uint sampler=(uint)(key==13?1:key==14?2:key==25?3:key==15?4:key==16?5:key==17?6:key==18?7:key==19?8:key==20?9:key==21?10:0);Check(Fn<StageState>(device,sampler!=0?69:67)(device,0,sampler!=0?sampler:key,U(a[1])));')
+begin=s.index('  static void CopyImage(');end=s.index('  static void ClearRegion(',begin)
+s=s[:begin]+'''  static int SetTargets(IntPtr device,IntPtr target,IntPtr depth){Check(Fn<SetColorTarget>(device,37)(device,0,target));return Fn<SetDepthTarget>(device,39)(device,depth);}
+  static void CopyImage(IntPtr device,IntPtr target,Dictionary<string,object> copy){Locked locked;Check(Fn<LockSurface>(target,13)(target,out locked,IntPtr.Zero,0));try{byte[] bytes=Convert.FromBase64String((string)copy["pixels"]);int stride=bytes.Length/Convert.ToInt32(copy["height"]),bpp=stride/Convert.ToInt32(copy["width"]);var r=Arr(copy["rect"]);var p=Arr(copy["point"]);int x=Convert.ToInt32(r[0]),y=Convert.ToInt32(r[1]),width=Convert.ToInt32(r[2])-x,height=Convert.ToInt32(r[3])-y,dx=Convert.ToInt32(p[0]),dy=Convert.ToInt32(p[1]);for(int row=0;row<height;row++)Marshal.Copy(bytes,(y+row)*stride+x*bpp,IntPtr.Add(locked.pixels,(dy+row)*locked.pitch+dx*bpp),width*bpp);}finally{Check(Fn<Simple>(target,14)(target));}}
+'''+s[end:]
+Path('scripts/native/D3D9Oracle.cs').write_text(s,encoding='utf-8')
