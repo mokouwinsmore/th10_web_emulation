@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <link rel="icon" href="data:,">
+  <title>東方風神録 — Mountain of Faith</title>
+  <style>
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;overscroll-behavior:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+    body{display:grid;place-items:center;touch-action:none}
+    canvas{display:block;width:var(--touhou-canvas-width,640px)!important;height:var(--touhou-canvas-height,480px)!important;max-width:none;max-height:none;outline:0;touch-action:none}
+    #status{position:fixed;inset:auto 0 1rem;text-align:center;color:#ddd;font:14px sans-serif;pointer-events:none}
+    #nativePerformance{position:fixed;top:env(safe-area-inset-top,0px);left:0;z-index:5;padding:4px 6px;max-width:95vw;background:#000c;color:#fff;font:12px/1.4 monospace;white-space:pre-line;pointer-events:none}
+  </style>
+</head>
+<body>
+  <canvas id="canvas" width="640" height="480" tabindex="0"></canvas>
+  <div id="status" role="status">准备风神录运行时…</div>
+  <output id="nativePerformance" hidden aria-label="Optional runtime performance diagnostics"></output>
+  <!-- runtime/hosted-main.mjs consumes window.parent.__eaglerPrepareManagedRuntimeDataV1.
+       Original EXE/DAT/D3DX content is supplied only through managed Package DATA. -->
+  <script type="module" src="runtime/hosted-main.mjs"></script>
+</body>
+</html>
