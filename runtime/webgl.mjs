@@ -1,7 +1,9 @@
 // Store D3D top rows at GL row zero. This preserves the D3D top-left
 // rasterization rule; flip only the final presentation to the DOM canvas.
+import {UniformCache} from './webgl-uniform-cache.mjs';
 const IDENTITY=new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
-const float=n=>new Float32Array(new Uint32Array([n]).buffer)[0];
+const floatBits=new Uint32Array(1),floatValue=new Float32Array(floatBits.buffer);
+const float=n=>{floatBits[0]=n;return floatValue[0];};
 const color=n=>[(n>>>16&255)/255,(n>>>8&255)/255,(n&255)/255,(n>>>24)/255];
 const vertex=`#version 300 es
 precision highp float;
@@ -64,7 +66,10 @@ void main(){vec4 t=hasTexture?texture(tex,vUV):vec4(1.0);
  gl_FragDepth=depth16?(floor(scaled)+floor(fract(scaled)-gl_FragCoord.z+0.5))/65535.0:gl_FragCoord.z;
 }`;
 export class WebGLD3D9 {
-  constructor(canvas,d3d){
+  constructor(canvas,d3d,{cacheState=true,measureWork=false,reuseStaging=true,debugErrors=false}={}){
+    this.cacheState=cacheState;
+    this.reuseStaging=reuseStaging;this.debugErrors=debugErrors;this.contextLost=false;
+    canvas.addEventListener?.('webglcontextlost',()=>{this.contextLost=true;});
     this.canvas=canvas;this.d3d=d3d;this.m=d3d.m;this.gl=canvas.getContext('webgl2',{alpha:false,antialias:false,preserveDrawingBuffer:true,premultipliedAlpha:false});if(!this.gl)throw new Error('WebGL 2 unavailable');const gl=this.gl;
     const clip=gl.getExtension('EXT_clip_control');if(clip)clip.clipControlEXT(clip.LOWER_LEFT_EXT,clip.ZERO_TO_ONE_EXT);const vertexSource=clip?vertex.replace('position.z*2.0-1.0','position.z').replace('gl_Position.z=gl_Position.z*2.0-gl_Position.w;',''):vertex;
     const shader=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s;};
@@ -73,8 +78,12 @@ export class WebGLD3D9 {
     this.vertices=gl.createBuffer();this.indices=gl.createBuffer();this.instanceMatrices=gl.createBuffer();this.surfaces=new Map();this.depths=new Map();d3d.onFlush=()=>this.flush();
     d3d.onDraw=draw=>this.queue(draw);d3d.onClear=clear=>{this.flush();this.clear(clear);};d3d.onCopy=(src,rect,dst,point)=>{this.flush();return this.copy(src,rect,dst,point);};d3d.onPresent=device=>{this.flush();this.present(device);};d3d.onReadSurface=s=>{this.flush();this.readSurface(s);};d3d.onRelease=s=>{this.flush();this.release(s);};this.batchEnabled=true;this.stats={calls:0,batches:0,uploadBytes:0,readBytes:0,ms:0};
     for(const name of ['onDraw','onClear','onCopy','onPresent','onReadSurface','onRelease']){const callback=d3d[name];d3d[name]=(...args)=>{const start=performance.now();try{return callback(...args);}finally{this.stats.ms+=performance.now()-start;}};}
+    this.submitMs=0;
+    if(measureWork)for(const name of ['draw','clear','copy','present','readSurface','release']){
+      const operation=this[name];this[name]=(...args)=>{const start=performance.now();try{return operation.apply(this,args);}finally{this.submitMs+=performance.now()-start;}};
+    }
   }
-  sameState(a,b,instanceWorld=false){if(a.fvf!==b.fvf||a.stride!==b.stride||a.texture!==b.texture||a.target!==b.target||a.depthTarget!==b.depthTarget)return false;const mapEqual=(a,b,compare=(a,b)=>a===b)=>{if(a===b)return true;if(a.size!==b.size)return false;for(const [key,value] of a)if(!b.has(key)||!compare(value,b.get(key),key))return false;return true;},bytesEqual=(a,b)=>a===b||a.length===b.length&&a.every((v,i)=>v===b[i]);return bytesEqual(a.viewport,b.viewport)&&mapEqual(a.states,b.states,(a,b,key)=>instanceWorld&&key===60||a===b)&&mapEqual(a.stages,b.stages)&&((a.fvf&14)===4||mapEqual(a.transforms,b.transforms,(a,b,key)=>instanceWorld&&key===256||bytesEqual(a,b)));}
+  sameState(a,b,instanceWorld=false){if(a.fvf!==b.fvf||a.stride!==b.stride||a.texture!==b.texture||a.target!==b.target||a.depthTarget!==b.depthTarget)return false;const mapEqual=(a,b,compare=(a,b)=>a===b)=>{if(a===b)return true;if(a.size!==b.size)return false;for(const [key,value] of a)if(!b.has(key)||!compare(value,b.get(key),key))return false;return true;},bytesEqual=(a,b)=>a===b||a.length===b.length&&a.every((v,i)=>v===b[i]);return bytesEqual(a.viewport,b.viewport)&&bytesEqual(a.scissor??[],b.scissor??[])&&mapEqual(a.states,b.states,(a,b,key)=>instanceWorld&&key===60||a===b)&&mapEqual(a.stages,b.stages)&&((a.fvf&14)===4||mapEqual(a.transforms,b.transforms,(a,b,key)=>instanceWorld&&key===256||bytesEqual(a,b)));}
   queue(d){this.stats.calls++;if(!this.batchEnabled||d.indices||![4,5,6].includes(d.primitive)){this.flush();this.draw(d);return;}
     // Repeated untransformed stage quads differ only in their model matrix.
     // Instancing retains every original matrix and primitive order; positions
@@ -86,13 +95,57 @@ export class WebGLD3D9 {
       if(this.batch.worlds.length>=1024)this.flush();return;
     }
     if(this.batch?.worlds)this.flush();
-    const previous=this.batch;if(previous&&!this.sameState(previous.draw,d))this.flush();let data=d.vertices;
+    const previous=this.batch;if(previous&&!this.sameState(previous.draw,d))this.flush();
+    if(this.reuseStaging){this.appendTriangles(d);return;}
+    let data=d.vertices;
     if(d.primitive!==4){data=new Uint8Array(d.count*3*d.stride);for(let i=0;i<d.count;i++){const indices=d.primitive===6?[0,i+1,i+2]:i&1?[i+1,i,i+2]:[i,i+1,i+2];indices.forEach((index,j)=>data.set(d.vertices.subarray(index*d.stride,(index+1)*d.stride),(i*3+j)*d.stride));}}
     this.batch??={draw:{...d,primitive:4,count:0},parts:[],length:0};const batch=this.batch;batch.parts.push(data);batch.length+=data.length;batch.draw.count+=d.count;if(batch.length>=1024*1024)this.flush();
   }
-  flush(){const batch=this.batch;if(!batch)return;this.batch=null;if(batch.worlds){if(batch.worlds.length===1){this.draw(batch.draw);return;}const matrices=new Uint8Array(batch.worlds.length*68),view=new DataView(matrices.buffer);batch.worlds.forEach((d,i)=>{matrices.set(d.transforms.get(256),i*68);view.setUint32(i*68+64,d.states.get(60)??0xffffffff,true);});this.draw({...batch.draw,instanceWorlds:matrices});return;}const data=new Uint8Array(batch.length);let offset=0;for(const part of batch.parts){data.set(part,offset);offset+=part.length;}batch.draw.vertices=data;this.draw(batch.draw);}
-  set(name,type,...value){this.gl[type](this.uniforms.get(name),...value);}
-  selectProgram(d){const state=(n,def=0)=>d.states.get(n)??def,stage=(n,def)=>d.stages.get(n)??def,values=[!!d.texture,!!state(15),!!state(28),stage(1,4),stage(4,2),stage(2,2),stage(3,1),stage(5,2),stage(6,1),state(25,8)],key=values.join(',');let variant=this.programs.get(key);const gl=this.gl;if(!variant){const names=['hasTexture','alphaTest','fogEnabled','colorOp','alphaOp','colorArg1','colorArg2','alphaArg1','alphaArg2','alphaFunc'];let source=fragment.replace('uniform bool hasTexture,alphaTest,fogEnabled;','').replace('uniform int colorOp,alphaOp,colorArg1,colorArg2,alphaArg1,alphaArg2,alphaFunc;','');source=source.replace('precision highp float;','precision highp float;\n'+names.map((name,i)=>`const ${i<3?'bool':'int'} ${name}=${values[i]};`).join('\n'));const program=gl.createProgram();gl.attachShader(program,this.vertexShader);gl.attachShader(program,this.shader(gl.FRAGMENT_SHADER,source));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(program));const uniforms=new Map();for(let i=0;i<gl.getProgramParameter(program,gl.ACTIVE_UNIFORMS);i++){const u=gl.getActiveUniform(program,i);uniforms.set(u.name,gl.getUniformLocation(program,u.name));}variant={program,uniforms};this.programs.set(key,variant);}this.program=variant.program;this.uniforms=variant.uniforms;gl.useProgram(this.program);}
+  // Adapted from the inspected upstream th10_web 1.0.3. Keep local scissor,
+  // uniform/FBO caches and packet order; reuse only transient submission bytes.
+  appendTriangles(d){
+    this.batch??={draw:{...d,primitive:4,count:0},length:0};const batch=this.batch,stride=d.stride,bytes=d.count*3*stride,end=batch.length+bytes;
+    if(!this.batchBytes||this.batchBytes.length<end){const next=new Uint8Array(Math.max(65536,end,(this.batchBytes?.length??0)*2));if(batch.length)next.set(this.batchBytes.subarray(0,batch.length));this.batchBytes=next;}
+    const data=this.batchBytes,source=d.vertices;let offset=batch.length;
+    if(d.primitive===4)data.set(source.subarray(0,bytes),offset);
+    else if(d.count){data.set(source.subarray(0,3*stride),offset);offset+=3*stride;
+      for(let i=1;i<d.count;i++){
+        const a=d.primitive===6?0:i&1?i+1:i,b=d.primitive===6?i+1:i&1?i:i+1,c=i+2;
+        data.set(source.subarray(a*stride,(a+1)*stride),offset);offset+=stride;
+        data.set(source.subarray(b*stride,(b+1)*stride),offset);offset+=stride;
+        data.set(source.subarray(c*stride,(c+1)*stride),offset);offset+=stride;
+      }
+    }
+    batch.length=end;batch.draw.count+=d.count;if(end>=1024*1024)this.flush();
+  }
+  flush(){const batch=this.batch;if(!batch)return;this.batch=null;
+    if(batch.worlds){
+      if(batch.worlds.length===1){this.draw(batch.draw);return;}
+      const length=batch.worlds.length*68;
+      if(this.reuseStaging&&(!this.worldBytes||this.worldBytes.length<length))this.worldBytes=new Uint8Array(Math.max(65536,length));
+      const matrices=this.reuseStaging?this.worldBytes.subarray(0,length):new Uint8Array(length),view=new DataView(matrices.buffer,matrices.byteOffset,matrices.byteLength);
+      batch.worlds.forEach((d,i)=>{matrices.set(d.transforms.get(256),i*68);view.setUint32(i*68+64,d.states.get(60)??0xffffffff,true);});
+      this.draw({...batch.draw,instanceWorlds:matrices});return;
+    }
+    if(this.reuseStaging)batch.draw.vertices=this.batchBytes.subarray(0,batch.length);
+    else{const data=new Uint8Array(batch.length);let offset=0;for(const part of batch.parts){data.set(part,offset);offset+=part.length;}batch.draw.vertices=data;}
+    // draw() uploads with bufferData before returning. Nothing retains this
+    // mutable staging view after the synchronous upload; tests snapshot it.
+    this.draw(batch.draw);
+  }
+  warmPrograms(){
+    for(const [texture,fog,op,arg1,arg2] of [[1,0,4,2,0],[1,0,2,0,0],[0,0,2,0,0],[1,1,4,2,3]]){
+      this.selectProgram({texture,states:new Map([[15,1],[28,fog],[25,7]]),stages:new Map([[1,op],[4,op],[2,arg1],[3,arg2],[5,arg1],[6,arg2]])});
+    }
+    this.checkError('shader preparation');
+  }
+  checkError(phase='explicit diagnostic'){
+    if(this.contextLost||this.gl.isContextLost?.())throw new Error('WebGL context lost');
+    const error=this.gl.getError();if(error)throw new Error(`WebGL error ${error} (${phase})`);
+  }
+  set(name,type,...value){if(this.cacheState&&this.uniformCache)this.uniformCache.set(name,type,value);else this.gl[type](this.uniforms.get(name),...value);}
+  selectProgram(d){const state=(n,def=0)=>d.states.get(n)??def,stage=(n,def)=>d.stages.get(n)??def,values=[!!d.texture,!!state(15),!!state(28),stage(1,4),stage(4,2),stage(2,2),stage(3,1),stage(5,2),stage(6,1),state(25,8)],key=values.join(',');let variant=this.programs.get(key);const gl=this.gl;if(!variant){const names=['hasTexture','alphaTest','fogEnabled','colorOp','alphaOp','colorArg1','colorArg2','alphaArg1','alphaArg2','alphaFunc'];let source=fragment.replace('uniform bool hasTexture,alphaTest,fogEnabled;','').replace('uniform int colorOp,alphaOp,colorArg1,colorArg2,alphaArg1,alphaArg2,alphaFunc;','');source=source.replace('precision highp float;','precision highp float;\n'+names.map((name,i)=>`const ${i<3?'bool':'int'} ${name}=${values[i]};`).join('\n'));const program=gl.createProgram();gl.attachShader(program,this.vertexShader);gl.attachShader(program,this.shader(gl.FRAGMENT_SHADER,source));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(program));const uniforms=new Map();for(let i=0;i<gl.getProgramParameter(program,gl.ACTIVE_UNIFORMS);i++){const u=gl.getActiveUniform(program,i);uniforms.set(u.name,gl.getUniformLocation(program,u.name));}variant={program,uniforms,cache:new UniformCache(gl,uniforms)};this.programs.set(key,variant);}if(!this.cacheState||this.program!==variant.program)gl.useProgram(variant.program);this.program=variant.program;this.uniforms=variant.uniforms;this.uniformCache=variant.cache;}
+  textureParameter(gpu,name,value){const previous=gpu.parameters??=new Map();if(!this.cacheState||previous.get(name)!==value){this.gl.texParameteri(this.gl.TEXTURE_2D,name,value);previous.set(name,value);}}
   pixels(s){
     const input=this.m.view(s.data,s.size),out=new Uint8Array(s.width*s.height*4),v=new DataView(input.buffer,input.byteOffset,input.byteLength);
     for(let y=0;y<s.height;y++)for(let x=0;x<s.width;x++){
@@ -104,7 +157,7 @@ export class WebGLD3D9 {
     }return out;
   }
   surface(s){const gl=this.gl;let gpu=this.surfaces.get(s.address);
-    if(!gpu){const texture=gl.createTexture(),framebuffer=gl.createFramebuffer();gpu={texture,framebuffer,version:-1,width:s.width,height:s.height};this.surfaces.set(s.address,gpu);gl.bindTexture(gl.TEXTURE_2D,texture);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);}
+    if(!gpu){const texture=gl.createTexture(),framebuffer=gl.createFramebuffer();gpu={texture,framebuffer,version:-1,width:s.width,height:s.height};this.surfaces.set(s.address,gpu);gl.bindTexture(gl.TEXTURE_2D,texture);this.textureParameter(gpu,gl.TEXTURE_MIN_FILTER,gl.LINEAR);this.textureParameter(gpu,gl.TEXTURE_MAG_FILTER,gl.LINEAR);this.textureParameter(gpu,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);this.textureParameter(gpu,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);}
     if(gpu.version!==s.version){
       this.stats.uploadBytes+=s.size;gl.bindTexture(gl.TEXTURE_2D,gpu.texture);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
       let pixels,format=gl.RGBA,type=gl.UNSIGNED_BYTE,internal=gl.RGBA8;
@@ -126,7 +179,7 @@ export class WebGLD3D9 {
     }
     return gpu;
   }
-  target(address,depthAddress=0){const gl=this.gl,s=this.d3d.com.get(address),gpu=this.surface(s);let depth=this.depths.get(depthAddress);if(depthAddress&&!depth){const d=this.d3d.com.get(depthAddress);depth={buffer:gl.createRenderbuffer(),stencil:d.format===75};gl.bindRenderbuffer(gl.RENDERBUFFER,depth.buffer);gl.renderbufferStorage(gl.RENDERBUFFER,depth.stencil?gl.DEPTH24_STENCIL8:d.format===80?gl.DEPTH_COMPONENT16:gl.DEPTH_COMPONENT24,d.width,d.height);this.depths.set(depthAddress,depth);}gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.framebuffer);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depth?.buffer??null);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.STENCIL_ATTACHMENT,gl.RENDERBUFFER,depth?.stencil?depth.buffer:null);return {s,gpu};}
+  target(address,depthAddress=0){const gl=this.gl,s=this.d3d.com.get(address),gpu=this.surface(s);let depth=this.depths.get(depthAddress);if(depthAddress&&!depth){const d=this.d3d.com.get(depthAddress);depth={buffer:gl.createRenderbuffer(),stencil:d.format===75};gl.bindRenderbuffer(gl.RENDERBUFFER,depth.buffer);gl.renderbufferStorage(gl.RENDERBUFFER,depth.stencil?gl.DEPTH24_STENCIL8:d.format===80?gl.DEPTH_COMPONENT16:gl.DEPTH_COMPONENT24,d.width,d.height);this.depths.set(depthAddress,depth);}gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.framebuffer);const depthBuffer=depth?.buffer??null,stencilBuffer=depth?.stencil?depth.buffer:null;if(!this.cacheState||gpu.depthBuffer!==depthBuffer){gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depthBuffer);gpu.depthBuffer=depthBuffer;}if(!this.cacheState||gpu.stencilBuffer!==stencilBuffer){gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.STENCIL_ATTACHMENT,gl.RENDERBUFFER,stencilBuffer);gpu.stencilBuffer=stencilBuffer;}return {s,gpu};}
   readSurface(s){const gpu=this.surfaces.get(s.address);if(!gpu?.rendered)return;this.stats.readBytes+=s.size;const gl=this.gl,pixels=new Uint8Array(s.width*s.height*4),output=this.m.view(s.data,s.size),v=new DataView(output.buffer,output.byteOffset,output.byteLength);gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.framebuffer);gl.readPixels(0,0,s.width,s.height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
     for(let y=0;y<s.height;y++)for(let x=0;x<s.width;x++){const p=(y*s.width+x)*4,r=pixels[p],g=pixels[p+1],b=pixels[p+2],a=pixels[p+3];
       if(s.format===21||s.format===22){const i=y*s.pitch+x*4;output[i]=b;output[i+1]=g;output[i+2]=r;output[i+3]=s.format===21?a:255;}
@@ -136,10 +189,11 @@ export class WebGLD3D9 {
   }
   release(s){const gl=this.gl,gpu=this.surfaces.get(s.address),depth=this.depths.get(s.address);if(depth){gl.deleteRenderbuffer(depth.buffer);this.depths.delete(s.address);}if(!gpu)return;gl.deleteTexture(gpu.texture);gl.deleteFramebuffer(gpu.framebuffer);this.surfaces.delete(s.address);}
   clear(c){const gl=this.gl,{s,gpu}=this.target(c.target,c.depthTarget),v=new DataView(c.viewport.buffer,c.viewport.byteOffset),rects=c.rects??[v.getUint32(0,true),v.getUint32(4,true),v.getUint32(0,true)+v.getUint32(8,true),v.getUint32(4,true)+v.getUint32(12,true)];gl.enable(gl.SCISSOR_TEST);gl.colorMask(true,true,true,true);gl.depthMask(true);gl.clearColor(...color(c.color));gl.clearDepth(c.depth);gl.clearStencil(c.stencil??0);gl.stencilMask(255);let bits=0;if(c.flags&1)bits|=gl.COLOR_BUFFER_BIT;if(c.flags&2)bits|=gl.DEPTH_BUFFER_BIT;if(c.flags&4)bits|=gl.STENCIL_BUFFER_BIT;
-    for(let i=0;i<rects.length;i+=4){gl.scissor(rects[i],rects[i+1],rects[i+2]-rects[i],rects[i+3]-rects[i+1]);gl.clear(bits);}gl.disable(gl.SCISSOR_TEST);gpu.rendered=true;
+    for(let i=0;i<rects.length;i+=4){const clip=c.scissor?new Int32Array(c.scissor.buffer,c.scissor.byteOffset,4):[0,0,s.width,s.height],left=Math.max(rects[i],clip[0]),top=Math.max(rects[i+1],clip[1]),right=Math.min(rects[i+2],clip[2]),bottom=Math.min(rects[i+3],clip[3]);if(right>left&&bottom>top){gl.scissor(left,top,right-left,bottom-top);gl.clear(bits);}}gl.disable(gl.SCISSOR_TEST);gpu.rendered=true;
   }
   draw(d){this.stats.batches++;const gl=this.gl,state=(n,def=0)=>d.states.get(n)??def,stage=(n,def=0)=>d.stages.get(n)??def;
     state(26)?gl.enable(gl.DITHER):gl.disable(gl.DITHER);
+    if(state(174)&&d.scissor){const r=new Int32Array(d.scissor.buffer,d.scissor.byteOffset,4);gl.enable(gl.SCISSOR_TEST);gl.scissor(r[0],r[1],r[2]-r[0],r[3]-r[1]);}else gl.disable(gl.SCISSOR_TEST);
     const tex=d.texture?this.d3d.com.get(d.texture).surface:null,texture=tex?this.surface(tex):null,{s,gpu}=this.target(d.target,d.depthTarget),vp=new DataView(d.viewport.buffer,d.viewport.byteOffset);
     const v=[0,4,8,12].map(o=>vp.getUint32(o,true));gl.viewport(v[0],v[1],v[2],v[3]);gl.depthRange(vp.getFloat32(16,true),vp.getFloat32(20,true));this.selectProgram(d);
     this.set('viewport','uniform4fv',v);const transformed=(d.fvf&14)===4;this.set('transformed','uniform1i',transformed?1:0);this.set('textureTransform','uniform1i',stage(24)?1:0);
@@ -149,7 +203,7 @@ export class WebGLD3D9 {
     this.set('hasTexture','uniform1i',texture?1:0);this.set('factor','uniform4fv',color(state(60,0xffffffff)));
     for(const [name,key,def] of [['colorOp',1,4],['colorArg1',2,2],['colorArg2',3,1],['alphaOp',4,2],['alphaArg1',5,2],['alphaArg2',6,1]]){const val=stage(key,def);if(name.endsWith('Op')&&(val<1||val>16))throw new Error('Unsupported texture op '+val);this.set(name,'uniform1i',val);}
     this.set('alphaTest','uniform1i',state(15));this.set('alphaRef','uniform1f',state(24)/255);this.set('alphaFunc','uniform1i',state(25,8));this.set('depth16','uniform1i',state(7)&&d.depthTarget&&this.d3d.com.get(d.depthTarget).format===80?1:0);
-    if(texture){gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,texture.texture);const address=n=>[0,gl.REPEAT,gl.MIRRORED_REPEAT,gl.CLAMP_TO_EDGE,gl.CLAMP_TO_EDGE,gl.CLAMP_TO_EDGE][n]??gl.REPEAT;gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,address(stage(13,1)));gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,address(stage(14,1)));gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,stage(17)===1?gl.NEAREST:gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,stage(16)===1?gl.NEAREST:gl.LINEAR);}
+    if(texture){gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,texture.texture);const address=n=>[0,gl.REPEAT,gl.MIRRORED_REPEAT,gl.CLAMP_TO_EDGE,gl.CLAMP_TO_EDGE,gl.CLAMP_TO_EDGE][n]??gl.REPEAT;this.textureParameter(texture,gl.TEXTURE_WRAP_S,address(stage(13,1)));this.textureParameter(texture,gl.TEXTURE_WRAP_T,address(stage(14,1)));this.textureParameter(texture,gl.TEXTURE_MIN_FILTER,stage(17)===1?gl.NEAREST:gl.LINEAR);this.textureParameter(texture,gl.TEXTURE_MAG_FILTER,stage(16)===1?gl.NEAREST:gl.LINEAR);}
     state(7)?gl.enable(gl.DEPTH_TEST):gl.disable(gl.DEPTH_TEST);gl.depthMask(!!state(14,1));const cmp=[0,gl.NEVER,gl.LESS,gl.EQUAL,gl.LEQUAL,gl.GREATER,gl.NOTEQUAL,gl.GEQUAL,gl.ALWAYS];gl.depthFunc(cmp[state(23,4)]);
     if(state(27)){gl.enable(gl.BLEND);const blend=[0,gl.ZERO,gl.ONE,gl.SRC_COLOR,gl.ONE_MINUS_SRC_COLOR,gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.DST_ALPHA,gl.ONE_MINUS_DST_ALPHA,gl.DST_COLOR,gl.ONE_MINUS_DST_COLOR,gl.SRC_ALPHA_SATURATE];gl.blendFunc(blend[state(19,2)],blend[state(20,1)]);gl.blendEquation([0,gl.FUNC_ADD,gl.FUNC_SUBTRACT,gl.FUNC_REVERSE_SUBTRACT,gl.MIN,gl.MAX][state(171,1)]);}else gl.disable(gl.BLEND);
     if(state(22,1)!==1){gl.enable(gl.CULL_FACE);gl.frontFace(gl.CW);gl.cullFace(state(22)===2?gl.BACK:gl.FRONT);}else gl.disable(gl.CULL_FACE);
@@ -163,5 +217,5 @@ export class WebGLD3D9 {
     else if(d.indices){gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,this.indices);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,d.indices,gl.STREAM_DRAW);gl.drawElements(mode,count,d.indexFormat===101?gl.UNSIGNED_SHORT:gl.UNSIGNED_INT,0);}else gl.drawArrays(mode,0,count);gpu.rendered=true;
   }
   copy(src,rect,dst,point){const gl=this.gl,from=this.surface(src),to=this.surface(dst),[x,y,r,b]=rect,w=r-x,h=b-y;gl.bindFramebuffer(gl.READ_FRAMEBUFFER,from.framebuffer);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,to.framebuffer);gl.disable(gl.SCISSOR_TEST);gl.blitFramebuffer(x,y,r,b,point[0],point[1],point[0]+w,point[1]+h,gl.COLOR_BUFFER_BIT,gl.NEAREST);to.rendered=true;to.version=dst.version+1;return true;}
-  present(device){const gl=this.gl,s=device.back,gpu=this.surface(s);gl.bindFramebuffer(gl.READ_FRAMEBUFFER,gpu.framebuffer);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,null);gl.disable(gl.SCISSOR_TEST);gl.blitFramebuffer(0,0,s.width,s.height,0,this.canvas.height,this.canvas.width,0,gl.COLOR_BUFFER_BIT,gl.NEAREST);gl.flush();const error=gl.getError();if(error)throw new Error('WebGL error '+error);}
+  present(device){const gl=this.gl,s=device.back,gpu=this.surface(s);gl.bindFramebuffer(gl.READ_FRAMEBUFFER,gpu.framebuffer);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,null);gl.disable(gl.SCISSOR_TEST);gl.blitFramebuffer(0,0,s.width,s.height,0,this.canvas.height,this.canvas.width,0,gl.COLOR_BUFFER_BIT,gl.NEAREST);gl.flush();if(this.contextLost)throw new Error('WebGL context lost');if(this.debugErrors)this.checkError('present');}
 }

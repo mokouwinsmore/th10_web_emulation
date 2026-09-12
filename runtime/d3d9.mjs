@@ -4,6 +4,13 @@ const bpp=format=>({20:3,21:4,22:4,23:2,24:2,25:2,26:2,28:1,50:1,51:2}[format]??
 // Draw packets retain immutable state. Copy a map only when a later setter
 // changes it, instead of copying every state group for every primitive.
 function setState(device,group,key,value){if(device[group].get(key)===value)return;const shared=group+'Shared';if(device[shared]){device[group]=new Map(device[group]);device[shared]=false;}device[group].set(key,value);}
+// Keep immutable packet snapshots by identity when a setter repeats identical
+// bytes. Compare raw bytes so NaNs, signed zero and matrix rounding stay exact.
+function snapshot(m,address,length,previous){
+  const source=m.view(address,length);
+  if(previous?.length===length){let i=0;for(;i<length&&previous[i]===source[i];i++);if(i===length)return previous;}
+  return source.slice();
+}
 export class Direct3D9 {
   constructor(host){this.host=host;this.m=host.m;this.com=new COM(host);this.frames=0;this.draws=[];this.devices=[];}
   create(){return this.com.create('IDirect3D9',this.d3dMethods).address;}
@@ -28,7 +35,18 @@ export class Direct3D9 {
     const d=this.com.create('IDirect3DDevice9',this.deviceMethods,{back,depth,target:back,depthTarget:depth,params:m.bytes(params,56),viewport:new Uint8Array(new Uint32Array([0,0,back.width,back.height,0,0x3f800000]).buffer),transforms:new Map(),states:new Map(),stages:new Map(),samplers:new Map(),textures:new Map(),streams:new Map(),fvf:0});
     this.com.addRef(back);this.com.addRef(depth);
     d.destroy=()=>{this.onFlush?.();for(const address of d.textures.values())if(address)this.com.release(address);for(const stream of d.streams.values())if(stream.address)this.com.release(stream.address);if(d.indices?.address)this.com.release(d.indices.address);this.com.release(d.target);if(d.depthTarget)this.com.release(d.depthTarget);this.com.release(back);this.com.release(depth);this.devices.splice(this.devices.indexOf(d),1);};
+    d.scissor=new Uint8Array(new Int32Array([0,0,back.width,back.height]).buffer);
     this.devices.push(d);this.device=d;return d;
+  }
+  stateBlock(){
+    const d=this.device,com=this.com,groups=['transforms','states','stages','samplers','textures','streams'];let saved;
+    const refs=s=>[...s.textures.values(),...s.streams.values()].map(v=>typeof v==='number'?v:v.address).concat(s.indices?.address??0).filter(Boolean);
+    const release=s=>{if(s)for(const address of refs(s))com.release(address);};
+    const capture=()=>{const next={viewport:d.viewport.slice(),scissor:d.scissor.slice(),fvf:d.fvf,indices:d.indices?{...d.indices}:null};for(const group of groups)next[group]=new Map(d[group]);for(const address of refs(next))com.addRef(address);release(saved);saved=next;return 0;};
+    const block=com.create('IDirect3DStateBlock9',{
+      GetDevice:a=>{com.addRef(d);this.m.u32(a[0],d.address);return 0;},Capture:capture,
+      Apply:()=>{for(const address of refs(saved))com.addRef(address);release(d);for(const group of groups){d[group]=new Map(saved[group]);d[group+'Shared']=false;}d.viewport=saved.viewport.slice();d.scissor=saved.scissor.slice();d.fvf=saved.fvf;d.indices=saved.indices?{...saved.indices}:null;return 0;},
+    });com.addRef(d);capture();block.destroy=()=>{release(saved);com.release(d);};return block;
   }
   deviceMethods={
     TestCooperativeLevel:zero,GetAvailableTextureMem:()=>256*1024*1024,EvictManagedResources:zero,GetDeviceCaps:a=>this.caps(a[0]),GetDisplayMode:a=>this.mode(a[1]),
@@ -39,11 +57,14 @@ export class Direct3D9 {
     Reset:a=>{this.device.params=this.m.bytes(a[0],56);return 0;},
     GetBackBuffer:a=>{const s=this.device.back;this.com.addRef(s);this.m.u32(a[3],s.address);return 0;},
     GetRenderTarget:a=>{const s=this.device.target;this.com.addRef(s);this.m.u32(a[1],s.address);return 0;},GetDepthStencilSurface:a=>{const s=this.device.depthTarget;if(s)this.com.addRef(s);this.m.u32(a[0],s?.address??0);return s?0:0x88760866;},
-    SetRenderTarget:a=>{if(a[0]!==0)return 0x8876086c;const d=this.device,target=this.com.get(a[1]);this.com.addRef(target);this.onFlush?.();this.com.release(d.target);d.target=target;d.viewport=new Uint8Array(new Uint32Array([0,0,target.width,target.height,0,0x3f800000]).buffer);return 0;},
+    SetRenderTarget:a=>{if(a[0]!==0)return 0x8876086c;const d=this.device,target=this.com.get(a[1]);this.com.addRef(target);this.onFlush?.();this.com.release(d.target);d.target=target;d.scissor=new Uint8Array(new Int32Array([0,0,target.width,target.height]).buffer);d.viewport=new Uint8Array(new Uint32Array([0,0,target.width,target.height,0,0x3f800000]).buffer);return 0;},
     SetDepthStencilSurface:a=>{const d=this.device,depth=a[0]?this.com.get(a[0]):null;if(depth)this.com.addRef(depth);this.onFlush?.();if(d.depthTarget)this.com.release(d.depthTarget);d.depthTarget=depth;return 0;},
-    Clear:a=>{const clear={type:'clear',target:this.device.target.address,depthTarget:this.device.depthTarget?.address??0,viewport:this.device.viewport,flags:a[2],color:a[3],depth:new Float32Array(new Uint32Array([a[4]]).buffer)[0],stencil:a[5],rects:a[0]?Array.from(this.m.readWords(a[1],a[0]*4)):null};if(this.onClear)this.onClear(clear);else this.draws.push(clear);return 0;},
-    SetTransform:a=>{setState(this.device,'transforms',a[0],this.m.bytes(a[1],64));return 0;},GetTransform:a=>{this.m.write(a[1],this.device.transforms.get(a[0])??new Uint8Array(new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]).buffer));return 0;},
-    SetViewport:a=>{this.device.viewport=this.m.bytes(a[0],24);return 0;},GetViewport:a=>{this.m.write(a[0],this.device.viewport);return 0;},
+    Clear:a=>{const clear={type:'clear',target:this.device.target.address,depthTarget:this.device.depthTarget?.address??0,viewport:this.device.viewport,scissor:this.device.states.get(174)?this.device.scissor:null,flags:a[2],color:a[3],depth:new Float32Array(new Uint32Array([a[4]]).buffer)[0],stencil:a[5],rects:a[0]?Array.from(this.m.readWords(a[1],a[0]*4)):null};if(this.onClear)this.onClear(clear);else this.draws.push(clear);return 0;},
+    SetTransform:a=>{setState(this.device,'transforms',a[0],snapshot(this.m,a[1],64,this.device.transforms.get(a[0])));return 0;},GetTransform:a=>{this.m.write(a[1],this.device.transforms.get(a[0])??new Uint8Array(new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]).buffer));return 0;},
+    SetViewport:a=>{this.device.viewport=snapshot(this.m,a[0],24,this.device.viewport);return 0;},GetViewport:a=>{this.m.write(a[0],this.device.viewport);return 0;},
+    CreateStateBlock:a=>{if(a[0]!==1)return 0x8876086c;this.m.u32(a[1],this.stateBlock().address);return 0;},
+    SetScissorRect:a=>{const rect=this.m.readWords(a[0],4).map(n=>n|0),target=this.device.target;if(rect[0]<0||rect[1]<0||rect[2]<rect[0]||rect[3]<rect[1]||rect[2]>target.width||rect[3]>target.height)return 0x8876086c;this.device.scissor=snapshot(this.m,a[0],16,this.device.scissor);return 0;},
+    GetScissorRect:a=>{this.m.write(a[0],this.device.scissor);return 0;},
     SetRenderState:a=>{setState(this.device,'states',a[0],a[1]);return 0;},GetRenderState:a=>{this.m.u32(a[1],this.device.states.get(a[0])??0);return 0;},
     SetTextureStageState:a=>{setState(this.device,'stages',a[0]*256+a[1],a[2]);return 0;},GetTextureStageState:a=>{this.m.u32(a[2],this.device.stages.get(a[0]*256+a[1])??0);return 0;},
     SetSamplerState:a=>{this.device.samplers.set(a[0]*256+a[1],a[2]);const key=({1:13,2:14,3:25,4:15,5:16,6:17,7:18,8:19,9:20,10:21})[a[1]];if(key)setState(this.device,'stages',a[0]*256+key,a[2]);return 0;},
@@ -95,6 +116,6 @@ export class Direct3D9 {
   draw(primitive,count,address,stride,indices=null){
     const d=this.device,elementCount=primitive===1?count:primitive===2?count*2:primitive===3?count+1:primitive===4?count*3:count+2,vertexCount=indices?indices.count:elementCount;
     let indexBytes=null;if(indices){indexBytes=this.m.bytes(indices.data,elementCount*(indices.format===101?2:4));const values=indices.format===101?new Uint16Array(indexBytes.buffer,indexBytes.byteOffset,elementCount):new Uint32Array(indexBytes.buffer,indexBytes.byteOffset,elementCount);for(let i=0;i<values.length;i++){values[i]-=indices.min;if(values[i]>=vertexCount)throw new Error('Index outside declared Direct3D vertex range');}}
-    const draw={type:'draw',primitive,count,stride,vertices:this.m.bytes(address+(indices?.min??0)*stride,vertexCount*stride),indices:indexBytes,indexFormat:indices?.format,fvf:d.fvf,texture:d.textures.get(0)??0,target:d.target.address,depthTarget:d.depthTarget?.address??0,viewport:d.viewport,states:d.states,stages:d.stages,transforms:d.transforms};d.statesShared=d.stagesShared=d.transformsShared=true;if(this.onDraw)this.onDraw(draw);else this.draws.push(draw);return 0;
+    const draw={type:'draw',primitive,count,stride,vertices:this.m.bytes(address+(indices?.min??0)*stride,vertexCount*stride),indices:indexBytes,indexFormat:indices?.format,fvf:d.fvf,texture:d.textures.get(0)??0,target:d.target.address,depthTarget:d.depthTarget?.address??0,viewport:d.viewport,scissor:d.scissor,states:d.states,stages:d.stages,transforms:d.transforms};d.statesShared=d.stagesShared=d.transformsShared=true;if(this.onDraw)this.onDraw(draw);else this.draws.push(draw);return 0;
   }
 }
